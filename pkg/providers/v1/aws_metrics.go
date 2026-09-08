@@ -23,11 +23,16 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
-	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
+)
+
+const (
+	awsAPIErrorTypeOther    = "other"
+	awsAPIErrorTypeThrottle = "throttle"
 )
 
 var (
@@ -63,7 +68,7 @@ var (
 	awsAPIResponseStatusTotal = metrics.NewCounterVec(
 		&metrics.CounterOpts{
 			Name:           "cloudprovider_aws_api_response_status_total",
-			Help:           "AWS API error response counts by status code and error type (terminal, after retries are exhausted)",
+			Help:           "AWS API error response counts by status code and bounded error type (throttle or other; terminal, after retries are exhausted)",
 			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"service", "operation", "status_code", "error_type"})
@@ -112,12 +117,11 @@ func awsAPIMetricsMiddleware() middleware.FinalizeMiddleware {
 			// an *awshttp.ResponseError; a nil error means a 2xx, which we do not count.
 			var respErr *awshttp.ResponseError
 			if errors.As(err, &respErr) && respErr.HTTPStatusCode() >= 400 {
-				errorType := ""
-				if respErr.HTTPStatusCode() == http.StatusServiceUnavailable {
-					var apiErr smithy.APIError
-					if errors.As(err, &apiErr) && apiErr.ErrorCode() == "RequestLimitExceeded" {
-						errorType = "throttle"
-					}
+				errorType := awsAPIErrorTypeOther
+				throttleErrorCode := retry.ThrottleErrorCode{Codes: retry.DefaultThrottleErrorCodes}
+				if respErr.HTTPStatusCode() == http.StatusTooManyRequests ||
+					throttleErrorCode.IsErrorThrottle(err).Bool() {
+					errorType = awsAPIErrorTypeThrottle
 				}
 
 				awsAPIResponseStatusTotal.With(metrics.Labels{
